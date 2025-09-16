@@ -60,26 +60,37 @@ DEFAULT_TMP_INPUT_DIR := ./.tmp/input
 DEFAULT_TMP_OUTPUT_DIR := ./.tmp/output
 
 # Parameters (overridable by user)
-INPUT_OVERLAY_PATH ?=
-INPUT_STACK_NAME ?=
-INPUT_SYSTEM_IMAGE ?=
-INPUT_RESOURCES_DIR ?=
-OUTPUT_SYSTEM_IMAGE ?=
-INPUT_ENV_VARS ?=
-DEBUG ?= false         # true | false | chroot
+DEBUG := $(strip $(DEBUG)) # true | false | chroot
+INPUT_ENV_VARS := $(strip $(INPUT_ENV_VARS))
+INPUT_OVERLAY_PATH := $(strip $(INPUT_OVERLAY_PATH))
+INPUT_STACK_NAME := $(strip $(INPUT_STACK_NAME))
+INPUT_SYSTEM_IMAGE := $(strip $(INPUT_SYSTEM_IMAGE))
+OUTPUT_SYSTEM_IMAGE := $(strip $(OUTPUT_SYSTEM_IMAGE))
+INPUT_RESOURCES_DIR := $(strip $(INPUT_RESOURCES_DIR))
+
+# inplace | copy (default: copy)
+INPUT_SYSTEM_IMAGE_MODE ?= copy
+INPUT_SYSTEM_IMAGE_MODE := $(strip $(INPUT_SYSTEM_IMAGE_MODE))
 
 # Working directories
 TMP_ROOT_DIR ?= $(DEFAULT_TMP_ROOT_DIR)
 TMP_INPUT_DIR ?= $(DEFAULT_TMP_INPUT_DIR)
 TMP_OUTPUT_DIR ?= $(DEFAULT_TMP_OUTPUT_DIR)
 
-# -------------------------------------------------------------------
+# Decide where we operate on the image
+ifeq ($(INPUT_SYSTEM_IMAGE_MODE),inplace)
+  SYSTEM_IMAGE_OPS_DIRECTORY := $(abspath $(dir $(INPUT_SYSTEM_IMAGE)))
+else
+  SYSTEM_IMAGE_OPS_DIRECTORY := $(abspath $(TMP_INPUT_DIR)/sys_image)
+endif
+
+# -------------------------------------1------------------------------
 # Validation helpers
 # -------------------------------------------------------------------
 define check_required_param
 	@if [ -z "$($(1))" ]; then \
 		echo "Error: $(1) parameter is required"; \
-		echo "Usage: make apply INPUT_OVERLAY_PATH=\"<dir1> [<dir2> ...]\" INPUT_STACK_NAME=<stack> INPUT_SYSTEM_IMAGE=<image_or_bundle> [OUTPUT_SYSTEM_IMAGE=<output_path>] [INPUT_RESOURCES_DIR=<dir>] [INPUT_ENV_VARS=KEY1=VAL1,...] [DEBUG=<true|false|chroot>]"; \
+		echo "Usage: make apply INPUT_OVERLAY_PATH=\"<dir1> [<dir2> ...]\" INPUT_STACK_NAME=<stack> INPUT_SYSTEM_IMAGE=<image_or_bundle> [INPUT_SYSTEM_IMAGE_MODE=<mode>] [OUTPUT_SYSTEM_IMAGE=<output_path>] [INPUT_RESOURCES_DIR=<dir>] [INPUT_ENV_VARS=KEY1=VAL1,...] [DEBUG=<true|false|chroot>]"; \
 		exit 1; \
 	fi
 endef
@@ -104,6 +115,7 @@ help:
 	@echo "  INPUT_OVERLAY_PATH          One or more overlay directories (separate multiple paths with space or ':')"
 	@echo "  INPUT_STACK_NAME            Name of the overlay stack to apply"
 	@echo "  INPUT_SYSTEM_IMAGE          Path or URL of the system image (or .zip bundle) to modify"
+	@echo "  INPUT_SYSTEM_IMAGE_MODE     Mode for modifying the system image (inplace or copy) (default: copy)"
 	@echo ""
 	@echo "Optional parameters:"
 	@echo "  OUTPUT_SYSTEM_IMAGE         Output path for modified image (new bundle .zip file or directory)"
@@ -141,6 +153,18 @@ DOCKER_STAMP         := $(STAMP_DIR)/$(STAMP_NAME).stamp
 
 .PHONY: docker docker/build docker/push docker/clean docker/rebuild
 docker: docker/build
+
+# --- Detect if we're already inside a container (Docker/Podman/Containerd)
+INSIDE_DOCKER := $(shell sh -c 'test -f /.dockerenv && echo 1 || (test -r /proc/1/cgroup && grep -qaE "(docker|containerd|podman)" /proc/1/cgroup && echo 1) || echo 0')
+
+ifeq ($(INSIDE_DOCKER),1)
+  # Do NOT call docker when already in a container
+  DOCKER_BUILD_DEPS :=
+  DOCKER_RUN :=
+else
+  DOCKER_BUILD_DEPS := docker/build
+  DOCKER_RUN := docker run --rm -it --privileged -v $(PWD):/project -v $(TMP_ROOT_DIR):/tmp/work -v /dev:/dev -w /project $(IMAGE_TAG)
+endif
 
 docker/build: $(DOCKER_STAMP)
 
@@ -189,9 +213,6 @@ docker/shell: docker/build
 	@echo "==> Starting interactive shell in $(IMAGE_TAG)"
 	$(DOCKER_RUN) bash
 
-# Docker run command (with privileged and volume mounts)
-DOCKER_RUN := docker run --rm -it --privileged -v $(PWD):/project -v $(TMP_ROOT_DIR):/tmp/work -v /dev:/dev -w /project $(IMAGE_TAG)
-
 ##########################################################
 # Host controls
 ##########################################################
@@ -219,7 +240,7 @@ clean:
 ##########################################################
 
 .PHONY: apply
-apply: docker/build
+apply: $(DOCKER_BUILD_DEPS)
 	$(call check_required_param,INPUT_OVERLAY_PATH)
 	$(call check_required_param,INPUT_STACK_NAME)
 	$(call check_required_param,INPUT_SYSTEM_IMAGE)
@@ -245,11 +266,13 @@ apply: docker/build
 	@echo "  Overlay paths:  $(INPUT_OVERLAY_PATH)"
 	@echo "  Stack name:     $(INPUT_STACK_NAME)"
 	@echo "  System image:   $(INPUT_SYSTEM_IMAGE)"
+	@echo "  Image mode:     $(if $(INPUT_SYSTEM_IMAGE_MODE),$(INPUT_SYSTEM_IMAGE_MODE),<none>)"
 	@echo "  Output target:  $(if $(OUTPUT_SYSTEM_IMAGE),$(OUTPUT_SYSTEM_IMAGE),<none>)"
 	@echo "  Resources dir:  $(if $(INPUT_RESOURCES_DIR),$(INPUT_RESOURCES_DIR),<none>)"
 	@echo "  Env variables:  $(if $(INPUT_ENV_VARS),$(INPUT_ENV_VARS),<none>)"
 	@echo "  Debug:          $(DEBUG)"
 	@echo "  Temp directory: $(abspath $(TMP_ROOT_DIR))"
+	@echo "  Ops dir:        $(SYSTEM_IMAGE_OPS_DIRECTORY)"
 	@echo ""
 	@echo "Preparing environment..."
 	@mkdir -p $(TMP_INPUT_DIR) $(TMP_OUTPUT_DIR)
@@ -303,48 +326,68 @@ apply: docker/build
 		cp -r "$(INPUT_RESOURCES_DIR)" "$(TMP_INPUT_DIR)/resources"; \
 	fi
 
-	@# === System image staging (ZIP or directory only) =========================
-	@echo "Staging system image into $(TMP_INPUT_DIR)/sys_image ..."
-	@rm -rf $(TMP_INPUT_DIR)/sys_image
-	@mkdir -p $(TMP_INPUT_DIR)/sys_image
-	@if echo "$(INPUT_SYSTEM_IMAGE)" | grep -qE '^https?://'; then \
-		echo "Error: INPUT_SYSTEM_IMAGE must be a local .zip file or a directory, not a URL. Use 'make download-and-unzip-release' first."; \
-		exit 1; \
-	fi
-	@if [ -d "$(INPUT_SYSTEM_IMAGE)" ]; then \
-		echo "Copying directory '$(INPUT_SYSTEM_IMAGE)' → $(TMP_INPUT_DIR)/sys_image"; \
-		cp -a "$(INPUT_SYSTEM_IMAGE)"/. "$(TMP_INPUT_DIR)/sys_image/"; \
-	elif echo "$(INPUT_SYSTEM_IMAGE)" | grep -qE '\.zip$$'; then \
-		echo "Copying ZIP '$(INPUT_SYSTEM_IMAGE)' → $(TMP_INPUT_DIR)"; \
-		cp "$(INPUT_SYSTEM_IMAGE)" "$(TMP_INPUT_DIR)/"; \
-		echo "Unzipping into $(TMP_INPUT_DIR)/sys_image ..."; \
-		$(DOCKER_RUN) bash -lc 'set -euo pipefail; cd /tmp/work/input; fname="$(notdir $(INPUT_SYSTEM_IMAGE))"; unzip -o "$$fname" -d sys_image >/dev/null'; \
+	# update the ops dir to be either $(SYSTEM_IMAGE_OPS_DIRECTORY) INPUT_SYSTEM_IMAGE_MODE is set to copy
+	# otherwise, use the original directory
+	@if [ "$(INPUT_SYSTEM_IMAGE_MODE)" = "inplace" ]; then \
+		SYSTEM_IMAGE_OPS_DIRECTORY="$(abspath $(dir $(INPUT_SYSTEM_IMAGE)))"; \
+		echo "Using system image in place from '$(INPUT_SYSTEM_IMAGE)'"; \
 	else \
-		echo "Error: INPUT_SYSTEM_IMAGE must be either a directory or a .zip file (got '$(INPUT_SYSTEM_IMAGE)')"; \
-		exit 1; \
+		SYSTEM_IMAGE_OPS_DIRECTORY="$(abspath $(SYSTEM_IMAGE_OPS_DIRECTORY))"; \
+		echo "Using copy of system image in '$(SYSTEM_IMAGE_OPS_DIRECTORY)'"; \
+	fi;
+
+	# === System image staging (ZIP or directory only) =========================
+	@if [ "$(INPUT_SYSTEM_IMAGE_MODE)" = "copy" ]; then \
+		echo "Staging system image into $(SYSTEM_IMAGE_OPS_DIRECTORY) ..."; \
+		rm -rf "$(SYSTEM_IMAGE_OPS_DIRECTORY)"; \
+		mkdir -p "$(SYSTEM_IMAGE_OPS_DIRECTORY)"; \
+		if [ -d "$(INPUT_SYSTEM_IMAGE)" ]; then \
+			echo "Copying directory '$(INPUT_SYSTEM_IMAGE)' → $(SYSTEM_IMAGE_OPS_DIRECTORY)"; \
+			cp -a "$(INPUT_SYSTEM_IMAGE)"/. "$(SYSTEM_IMAGE_OPS_DIRECTORY)"; \
+		elif echo "$(INPUT_SYSTEM_IMAGE)" | grep -qE '\.zip$$'; then \
+			echo "Copying ZIP '$(INPUT_SYSTEM_IMAGE)' → $(TMP_INPUT_DIR)"; \
+			cp "$(INPUT_SYSTEM_IMAGE)" "$(TMP_INPUT_DIR)/"; \
+			echo "Unzipping into $(SYSTEM_IMAGE_OPS_DIRECTORY) ..."; \
+			$(DOCKER_RUN) bash -lc 'set -euo pipefail; cd /tmp/work/input; fname="$(notdir $(INPUT_SYSTEM_IMAGE))"; unzip -o "$$fname" -d sys_image >/dev/null'; \
+		else \
+			echo "Error: INPUT_SYSTEM_IMAGE must be either a directory or a .zip file (got '\''$(INPUT_SYSTEM_IMAGE)'\'' )"; \
+			exit 1; \
+		fi; \
+	else \
+		echo "Using system image in place from '$(INPUT_SYSTEM_IMAGE)'"; \
 	fi
 
-	@# === Determine fixed image path inside sys_image/ =========================
-	@echo "Validating expected image path under sys_image/ ..."
-	@if [ ! -f "$(TMP_INPUT_DIR)/sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" ]; then \
+	@# === Determine fixed image path inside SYSTEM_IMAGE_OPS_DIRECTORY =========================
+	@echo "Validating expected image path under SYSTEM_IMAGE_OPS_DIRECTORY ..."
+	@if [ ! -f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" ]; then \
 		echo "Error: expected image not found:"; \
-		echo "  $(TMP_INPUT_DIR)/sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4"; \
-		echo "Directory listing (top-level of sys_image):"; \
-		ls -al "$(TMP_INPUT_DIR)/sys_image" || true; \
+		echo "  $(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4"; \
+		echo "Directory listing (top-level of SYSTEM_IMAGE_OPS_DIRECTORY):"; \
+		ls -al "$(SYSTEM_IMAGE_OPS_DIRECTORY)" || true; \
 		exit 1; \
 	fi
 	@echo "Main image file: sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4"
+	@if [ -f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/efi.img" ]; then \
+		echo "EFI image file:  sys_image/images/qcm6490/edl/efi.img"; \
+	else \
+		echo "EFI image file:  <none detected>"; \
+	fi
 
 	@# === Run overlay application inside Docker ================================
 	@echo "Applying overlay stack '$(INPUT_STACK_NAME)'..."
-	@$(DOCKER_RUN) bash ./run-overlay.sh \
+	@set -e; \
+	EFI_OPT=""; \
+	if [ -f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/efi.img" ]; then \
+	  EFI_OPT='-E /tmp/work/input/sys_image/images/qcm6490/edl/efi.img'; \
+	fi; \
+	$(DOCKER_RUN) bash ./run-overlay.sh \
 		-f "/tmp/work/input/sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" \
 		-r "/tmp/work/input/resources" \
 		-s "$(INPUT_STACK_NAME)" \
-		-d "$(DEBUG)"$(if $(INPUT_ENV_VARS), -e "$(INPUT_ENV_VARS)",)
+		-d "$(DEBUG)"$(if $(INPUT_ENV_VARS), -e "$(INPUT_ENV_VARS)",) $$EFI_OPT
 	@echo "Overlay application completed."
 
-	@# === Package output (zip of sys_image/, or xz/raw of ext4) ================
+	@# === Package output (zip of $(SYSTEM_IMAGE_OPS_DIRECTORY)) =========
 	@if [ -n "$(OUTPUT_SYSTEM_IMAGE)" ]; then \
 		echo "Packaging output..."; \
 		if echo "$(OUTPUT_SYSTEM_IMAGE)" | grep -qE '\.zip$$'; then \
@@ -352,7 +395,7 @@ apply: docker/build
 			mv "$(TMP_OUTPUT_DIR)/$(notdir $(OUTPUT_SYSTEM_IMAGE))" "$(OUTPUT_SYSTEM_IMAGE)"; \
 			echo "Output bundle created: $(abspath $(OUTPUT_SYSTEM_IMAGE))"; \
 		else \
-			mv "$(TMP_INPUT_DIR)/sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" "$(OUTPUT_SYSTEM_IMAGE)"; \
+			mv "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" "$(OUTPUT_SYSTEM_IMAGE)"; \
 			echo "Output image file created: $(abspath $(OUTPUT_SYSTEM_IMAGE))"; \
 		fi; \
 	else \
@@ -394,7 +437,7 @@ docker-sparse-image:
 #   make download-release INPUT_SYSTEM_IMAGE=https://linux-dist.particle.io/release/tachyon-ubuntu-20.04-RoW-desktop-1.0.167
 # -------------------------------------------------------------------
 .PHONY: download-release-helper
-download-release-helper: docker/build
+download-release-helper: $(DOCKER_BUILD_DEPS)
 	$(call check_required_param,INPUT_SYSTEM_IMAGE)
 	@# Prepare temp directory
 	@mkdir -p $(TMP_INPUT_DIR)
@@ -429,7 +472,7 @@ download-release-helper: docker/build
 #   - This expects the downloaded file to be a ZIP archive. It will fail if not.
 # -------------------------------------------------------------------
 .PHONY: download-and-unzip-release-helper
-download-and-unzip-release-helper: docker/build
+download-and-unzip-release-helper: $(DOCKER_BUILD_DEPS)
 	$(call check_required_param,INPUT_SYSTEM_IMAGE)
 	@# Prepare temp directory
 	@mkdir -p $(TMP_INPUT_DIR)

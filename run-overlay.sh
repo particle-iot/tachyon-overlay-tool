@@ -77,7 +77,8 @@ if [ ! -d "$OVERLAY_ROOT/overlays" ] || [ ! -d "$OVERLAY_ROOT/stacks" ]; then
 fi
 
 # --- Safe defaults / PATH -----------------------------------------------------
-TMP_DIR="${TMP_DIR:-/tmp/work}"
+# Use a fast, container-local scratch by default (overridable)
+TMP_DIR="${TMP_DIR:-/var/tmp/tachyon_overlay}"   # was /tmp/work (bind mount; slow on Docker for Mac)
 MOUNT_POINT="/mnt/tachyon"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 mkdir -p "$TMP_DIR"
@@ -169,7 +170,7 @@ if [ -n "$EFI_IMG" ]; then
   [ -e "$PART_ROOT" ] || { echo "ERROR: missing ${LOOPDEV}p1"; exit 1; }
 
   echo "==> dd rootfs -> ${PART_ROOT} ..."
-  sudo dd if="$raw_ext4" of="${PART_ROOT}" status=progress conv=fsync
+  sudo dd if="$raw_ext4" of="${PART_ROOT}" bs=8M iflag=fullblock oflag=direct status=progress
   sync
 
   echo "==> Mounting root and EFI ..."
@@ -186,16 +187,16 @@ if [ -n "$EFI_IMG" ]; then
   # --- Run overlay -----------------------------------------------------------
   if [ "$DEBUG" = "chroot" ]; then
     echo "Applying stack: $STACK"
-    python3 /project/overlay.py apply --overlay-dirs "/tmp/work/input" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
+    python3 "$OVERLAY_CLI" apply --overlay-dirs "$OVERLAY_ROOT" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
     echo "Entering chroot (debug mode). Type 'exit' to resume..."
     sudo chroot "$MOUNT_POINT" /bin/bash
   elif [ "$DEBUG" = "true" ]; then
     echo "Debugging enabled. Mounted at $MOUNT_POINT"
-    echo "To call the overlay, run: python3 /project/overlay.py apply --mount-point $MOUNT_POINT --resources $RESOURCES --stack $STACK"
+    echo "To call the overlay, run: python3 "$OVERLAY_CLI" apply --mount-point $MOUNT_POINT --resources $RESOURCES --stack $STACK"
     /bin/bash
   else
     echo "Applying stack: $STACK"
-    python3 /project/overlay.py apply --overlay-dirs "/tmp/work/input" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
+    python3 "$OVERLAY_CLI" apply --overlay-dirs "$OVERLAY_ROOT" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
   fi
 
   # Clean device.map, unmount, persist back, cleanup
@@ -212,7 +213,7 @@ if [ -n "$EFI_IMG" ]; then
   sync
 
   echo "==> dd ${PART_ROOT} -> $raw_ext4 (persist changes) ..."
-  sudo dd if="${PART_ROOT}" of="$raw_ext4" status=progress conv=fsync
+  sudo dd if="${PART_ROOT}" of="$raw_ext4" bs=8M iflag=fullblock oflag=direct status=progress
   sync
 
   echo "==> Detaching loop & cleaning up ..."
@@ -251,16 +252,16 @@ if [ "$IS_SPARSE" = true ]; then
 
   if [ "$DEBUG" = "chroot" ]; then
     echo "Applying stack: $STACK"
-    python3 /project/overlay.py apply --overlay-dirs "/tmp/work/input" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
+    python3 "$OVERLAY_CLI" apply --overlay-dirs "$OVERLAY_ROOT" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
     echo "Entering chroot (debug mode). Type 'exit' to resume..."
     sudo chroot "$MOUNT_POINT" /bin/bash
   elif [ "$DEBUG" = "true" ]; then
     echo "Debugging enabled. Mounted at $MOUNT_POINT"
-    echo "To call the overlay, run: python3 /project/overlay.py apply --mount-point $MOUNT_POINT --resources $RESOURCES --stack $STACK"
+    echo "To call the overlay, run: python3 "$OVERLAY_CLI" apply --mount-point $MOUNT_POINT --resources $RESOURCES --stack $STACK"
     /bin/bash
   else
     echo "Applying stack: $STACK"
-    python3 /project/overlay.py apply --overlay-dirs "/tmp/work/input" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
+    python3 "$OVERLAY_CLI" apply --overlay-dirs "$OVERLAY_ROOT" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"
   fi
 
   [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
@@ -288,8 +289,8 @@ fi
 # Apply overlay, honouring DEBUG modes
 if [ "$DEBUG" = "chroot" ]; then
   echo "Applying stack: $STACK"
-  python3 /project/overlay.py apply \
-    --overlay-dirs "/tmp/work/input" \
+  python3 "$OVERLAY_CLI" apply \
+    --overlay-dirs "$OVERLAY_ROOT" \
     --mount-point "$MOUNT_POINT" \
     --resources "$RESOURCES" \
     --stack="$STACK"
@@ -297,12 +298,12 @@ if [ "$DEBUG" = "chroot" ]; then
   sudo chroot "$MOUNT_POINT" /bin/bash
 elif [ "$DEBUG" = "true" ]; then
   echo "Debugging enabled. Mounted at $MOUNT_POINT"
-  echo "To call the overlay, run: python3 /project/overlay.py apply --overlay-dirs /tmp/work/input --mount-point $MOUNT_POINT --resources $RESOURCES --stack $STACK"
+  echo "To call the overlay, run: python3 "$OVERLAY_CLI" apply --overlay-dirs $OVERLAY_ROOT --mount-point $MOUNT_POINT --resources $RESOURCES --stack $STACK"
   /bin/bash
 else
   echo "Applying stack: $STACK"
-  python3 /project/overlay.py apply \
-    --overlay-dirs "/tmp/work/input" \
+  python3 "$OVERLAY_CLI" apply \
+    --overlay-dirs "$OVERLAY_ROOT" \
     --mount-point "$MOUNT_POINT" \
     --resources "$RESOURCES" \
     --stack="$STACK"

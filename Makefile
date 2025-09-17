@@ -56,8 +56,13 @@ VERSION := $(shell \
 
 # Default directories
 DEFAULT_TMP_ROOT_DIR := ./.tmp
-DEFAULT_TMP_INPUT_DIR := ./.tmp/input
-DEFAULT_TMP_OUTPUT_DIR := ./.tmp/output
+TMP_ROOT_DIR ?= $(DEFAULT_TMP_ROOT_DIR)
+
+DEFAULT_TMP_INPUT_DIR := $(TMP_ROOT_DIR)/input
+TMP_INPUT_DIR ?= $(DEFAULT_TMP_INPUT_DIR)
+
+DEFAULT_TMP_OUTPUT_DIR := $(TMP_ROOT_DIR)/output
+TMP_OUTPUT_DIR ?= $(DEFAULT_TMP_OUTPUT_DIR)
 
 # Parameters (overridable by user)
 DEBUG := $(strip $(DEBUG)) # true | false | chroot
@@ -72,16 +77,40 @@ INPUT_RESOURCES_DIR := $(strip $(INPUT_RESOURCES_DIR))
 INPUT_SYSTEM_IMAGE_MODE ?= copy
 INPUT_SYSTEM_IMAGE_MODE := $(strip $(INPUT_SYSTEM_IMAGE_MODE))
 
-# Working directories
-TMP_ROOT_DIR ?= $(DEFAULT_TMP_ROOT_DIR)
-TMP_INPUT_DIR ?= $(DEFAULT_TMP_INPUT_DIR)
-TMP_OUTPUT_DIR ?= $(DEFAULT_TMP_OUTPUT_DIR)
-
 # Decide where we operate on the image
 ifeq ($(INPUT_SYSTEM_IMAGE_MODE),inplace)
-  SYSTEM_IMAGE_OPS_DIRECTORY := $(abspath $(dir $(INPUT_SYSTEM_IMAGE)))
+  SYSTEM_IMAGE_OPS_DIRECTORY := $(INPUT_SYSTEM_IMAGE)
 else
   SYSTEM_IMAGE_OPS_DIRECTORY := $(abspath $(TMP_INPUT_DIR)/sys_image)
+endif
+
+
+# ---- Host <-> container path mapping ---------------------------------
+HOST_TMP_ABS        := $(abspath $(TMP_ROOT_DIR))
+CONTAINER_TMP_ROOT  := /tmp/work
+# Convert a host path under $(TMP_ROOT_DIR) to the container path under /tmp/work
+to_container = $(patsubst $(HOST_TMP_ABS)%,$(CONTAINER_TMP_ROOT)%,$(abspath $(1)))
+
+# ---- Are we already running inside a container? (robust) --------------
+INSIDE_DOCKER := $(shell sh -c '\
+  if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then \
+    echo 1; \
+  elif grep -qaE "(docker|containerd|kubepods|podman|libpod)" /proc/1/cgroup 2>/dev/null; then \
+    echo 1; \
+  elif grep -qaE "(docker|containerd|podman|libpod)" /proc/self/mountinfo 2>/dev/null; then \
+    echo 1; \
+  elif [ -n "$$container" ]; then \
+    echo 1; \
+  else \
+    echo 0; \
+  fi')
+
+
+# Overlay root to give the script (container path vs host path)
+ifeq ($(INSIDE_DOCKER),1)
+  OVERLAY_ROOT_FOR_SCRIPT := $(abspath $(TMP_INPUT_DIR))
+else
+  OVERLAY_ROOT_FOR_SCRIPT := /tmp/work/input
 endif
 
 # -------------------------------------1------------------------------
@@ -153,9 +182,6 @@ DOCKER_STAMP         := $(STAMP_DIR)/$(STAMP_NAME).stamp
 
 .PHONY: docker docker/build docker/push docker/clean docker/rebuild
 docker: docker/build
-
-# --- Detect if we're already inside a container (Docker/Podman/Containerd)
-INSIDE_DOCKER := $(shell sh -c 'test -f /.dockerenv && echo 1 || (test -r /proc/1/cgroup && grep -qaE "(docker|containerd|podman)" /proc/1/cgroup && echo 1) || echo 0')
 
 ifeq ($(INSIDE_DOCKER),1)
   # Do NOT call docker when already in a container
@@ -263,6 +289,7 @@ apply: $(DOCKER_BUILD_DEPS)
 		exit 1; \
 	fi
 	@echo "Configuration:"
+	@echo "  Container: 		 $(if $(INSIDE_DOCKER),yes,no)"
 	@echo "  Overlay paths:  $(INPUT_OVERLAY_PATH)"
 	@echo "  Stack name:     $(INPUT_STACK_NAME)"
 	@echo "  System image:   $(INPUT_SYSTEM_IMAGE)"
@@ -326,8 +353,8 @@ apply: $(DOCKER_BUILD_DEPS)
 		cp -r "$(INPUT_RESOURCES_DIR)" "$(TMP_INPUT_DIR)/resources"; \
 	fi
 
-	# update the ops dir to be either $(SYSTEM_IMAGE_OPS_DIRECTORY) INPUT_SYSTEM_IMAGE_MODE is set to copy
-	# otherwise, use the original directory
+	# update the ops dir to be either $(SYSTEM_IMAGE_OPS_DIRECTORY) INPUT_SYSTEM_IMAGE_MODE IF its set to copy
+	# otherwise, use the original directory $(INPUT_SYSTEM_IMAGE)
 	@if [ "$(INPUT_SYSTEM_IMAGE_MODE)" = "inplace" ]; then \
 		SYSTEM_IMAGE_OPS_DIRECTORY="$(abspath $(dir $(INPUT_SYSTEM_IMAGE)))"; \
 		echo "Using system image in place from '$(INPUT_SYSTEM_IMAGE)'"; \
@@ -366,9 +393,9 @@ apply: $(DOCKER_BUILD_DEPS)
 		ls -al "$(SYSTEM_IMAGE_OPS_DIRECTORY)" || true; \
 		exit 1; \
 	fi
-	@echo "Main image file: sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4"
+	@echo "Main image file: $(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4"
 	@if [ -f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/efi.img" ]; then \
-		echo "EFI image file:  sys_image/images/qcm6490/edl/efi.img"; \
+		echo "EFI image file:  $(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/efi.img"; \
 	else \
 		echo "EFI image file:  <none detected>"; \
 	fi
@@ -378,20 +405,21 @@ apply: $(DOCKER_BUILD_DEPS)
 	@set -e; \
 	EFI_OPT=""; \
 	if [ -f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/efi.img" ]; then \
-	  EFI_OPT='-E /tmp/work/input/sys_image/images/qcm6490/edl/efi.img'; \
+	  EFI_OPT='-E $(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/efi.img'; \
 	fi; \
 	$(DOCKER_RUN) bash ./run-overlay.sh \
-		-f "/tmp/work/input/sys_image/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" \
-		-r "/tmp/work/input/resources" \
+		-f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" \
+		-r "$(SYSTEM_IMAGE_OPS_DIRECTORY)/resources" \
 		-s "$(INPUT_STACK_NAME)" \
-		-d "$(DEBUG)"$(if $(INPUT_ENV_VARS), -e "$(INPUT_ENV_VARS)",) $$EFI_OPT
+		-d "$(DEBUG)"$(if $(INPUT_ENV_VARS), -e "$(INPUT_ENV_VARS)",) \
+		-O "$(INPUT_OVERLAY_PATH)" $$EFI_OPT
 	@echo "Overlay application completed."
 
 	@# === Package output (zip of $(SYSTEM_IMAGE_OPS_DIRECTORY)) =========
 	@if [ -n "$(OUTPUT_SYSTEM_IMAGE)" ]; then \
 		echo "Packaging output..."; \
 		if echo "$(OUTPUT_SYSTEM_IMAGE)" | grep -qE '\.zip$$'; then \
-			$(DOCKER_RUN) bash -lc "cd /tmp/work/input/sys_image && zip -r -q /tmp/work/output/$(notdir $(OUTPUT_SYSTEM_IMAGE)) ."; \
+			$(DOCKER_RUN) bash -lc "cd /$(SYSTEM_IMAGE_OPS_DIRECTORY)/ && zip -r -q /tmp/work/output/$(notdir $(OUTPUT_SYSTEM_IMAGE)) ."; \
 			mv "$(TMP_OUTPUT_DIR)/$(notdir $(OUTPUT_SYSTEM_IMAGE))" "$(OUTPUT_SYSTEM_IMAGE)"; \
 			echo "Output bundle created: $(abspath $(OUTPUT_SYSTEM_IMAGE))"; \
 		else \
@@ -399,7 +427,7 @@ apply: $(DOCKER_BUILD_DEPS)
 			echo "Output image file created: $(abspath $(OUTPUT_SYSTEM_IMAGE))"; \
 		fi; \
 	else \
-		echo "No output specified; modified image remains in $(abspath $(TMP_INPUT_DIR))/sys_image."; \
+		echo "No output specified; modified image remains in $(abspath $(SYSTEM_IMAGE_OPS_DIRECTORY))."; \
 	fi
 
 ## Unsparse (convert) the system image if needed

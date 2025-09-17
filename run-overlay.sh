@@ -6,13 +6,15 @@ if [ "${DEBUG:-}" = "true" ]; then
 fi
 
 usage() {
-  echo "Usage: $0 -f <filesystem> -s <stack> -r <resources> -d <debug> [-e <env_list>] [-E <efi_image>]"
+  echo "Usage: $0 -f <filesystem> -s <stack> -r <resources> -d <debug> [-e <env_list>] [-E <efi_image>] [-O <overlay_root>]"
   echo "  -f <filesystem>: Path to the EXT4 system/root filesystem image to modify (raw EXT4 or Android sparse)."
   echo "  -r <resources> : Path to extra resources directory."
   echo "  -s <stack>     : Stack name of the overlay stack to apply."
   echo "  -d <debug>     : true | false | chroot — Debug mode (optional)."
   echo "  -e <env_list>  : Comma-separated list of KEY=VALUE pairs to export (optional)."
   echo "  -E <efi_image> : OPTIONAL path to a FAT EFI image to mount at /boot/efi (24.04 flow)."
+  echo "  -O <overlay_root>: OPTIONAL path to overlay root (parent dir of 'overlays/' and 'stacks/')."
+  echo "                     Defaults to /tmp/work/input."
   exit 1
 }
 
@@ -22,9 +24,10 @@ FILESYSTEM=""
 RESOURCES=""
 STACK=""
 EFI_IMG=""
+OVERLAY_ROOT="/tmp/work/input"   # NEW: default for Docker flow
 ENV_LIST="${ENV_LIST:-}"
 
-while getopts ":f:r:d:s:e:E:" opt; do
+while getopts ":f:r:d:s:e:E:O:" opt; do
   case $opt in
     f) FILESYSTEM="$OPTARG" ;;
     r) RESOURCES="$OPTARG" ;;
@@ -32,6 +35,7 @@ while getopts ":f:r:d:s:e:E:" opt; do
     s) STACK="$OPTARG" ;;
     e) ENV_LIST="$OPTARG" ;;
     E) EFI_IMG="$OPTARG" ;;
+    O) OVERLAY_ROOT="$OPTARG" ;;  # NEW
     *) usage ;;
   esac
 done
@@ -50,8 +54,26 @@ fi
 [ -f "$FILESYSTEM" ] || { echo "Error: Filesystem '$FILESYSTEM' does not exist." >&2; exit 1; }
 if [ -n "$EFI_IMG" ] && [ ! -f "$EFI_IMG" ]; then
   echo "Error: EFI image '$EFI_IMG' does not exist." >&2
-  ls -al "$EFI_IMG"
+  ls -al "$EFI_IMG" || true
   exit 1
+fi
+
+# resolve overlay.py relative to this script (works in/out of Docker)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OVERLAY_CLI="${OVERLAY_CLI:-$SCRIPT_DIR/overlay.py}"
+if [ ! -f "$OVERLAY_CLI" ]; then
+  # Fallback to CWD if someone runs from repo root
+  if [ -f "./overlay.py" ]; then
+    OVERLAY_CLI="./overlay.py"
+  else
+    echo "Error: overlay.py not found at '$OVERLAY_CLI' or './overlay.py'." >&2
+    exit 1
+  fi
+fi
+
+# Optional sanity: ensure OVERLAY_ROOT has overlays/ and stacks/ (warn only)
+if [ ! -d "$OVERLAY_ROOT/overlays" ] || [ ! -d "$OVERLAY_ROOT/stacks" ]; then
+  echo "Warning: OVERLAY_ROOT ($OVERLAY_ROOT) may be missing 'overlays/' or 'stacks/'." >&2
 fi
 
 # --- Safe defaults / PATH -----------------------------------------------------
@@ -68,6 +90,7 @@ echo "    STACK     : $STACK"
 echo "    DEBUG     : ${DEBUG:-auto}"
 echo "    ENV_LIST  : ${ENV_LIST:-}"
 echo "    EFI_IMG   : ${EFI_IMG:-<none>}"
+echo "    OVERLAYS  : ${OVERLAY_ROOT}"
 
 # --- Helpers ------------------------------------------------------------------
 cleanup_mounts() {
@@ -155,12 +178,12 @@ if [ -n "$EFI_IMG" ]; then
   sudo mkdir -p "$MOUNT_POINT/boot/efi"
   sudo mount -o loop "$EFI_IMG" "$MOUNT_POINT/boot/efi"
 
-  # GRUB device.map (matches CI)
+  # GRUB device.map
   if [ -d "$MOUNT_POINT/boot/grub" ]; then
     printf "(hd0) %s\n(hd1) %sp1\n" "$LOOPDEV" "$LOOPDEV" | sudo tee "$MOUNT_POINT/boot/grub/device.map" >/dev/null || true
   fi
 
-  # Run overlay (honour DEBUG modes)
+  # --- Run overlay -----------------------------------------------------------
   if [ "$DEBUG" = "chroot" ]; then
     echo "Applying stack: $STACK"
     python3 /project/overlay.py apply --overlay-dirs "/tmp/work/input" --mount-point "$MOUNT_POINT" --resources "$RESOURCES" --stack="$STACK"

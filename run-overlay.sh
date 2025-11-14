@@ -25,9 +25,10 @@ RESOURCES=""
 STACK=""
 EFI_IMG=""
 OVERLAY_ROOT="/tmp/work/input"   # NEW: default for Docker flow
+VENDOR_IMG=""
 ENV_LIST="${ENV_LIST:-}"
 
-while getopts ":f:r:d:s:e:E:O:" opt; do
+while getopts ":f:r:d:s:e:E:O:V:" opt; do
   case $opt in
     f) FILESYSTEM="$OPTARG" ;;
     r) RESOURCES="$OPTARG" ;;
@@ -36,6 +37,7 @@ while getopts ":f:r:d:s:e:E:O:" opt; do
     e) ENV_LIST="$OPTARG" ;;
     E) EFI_IMG="$OPTARG" ;;
     O) OVERLAY_ROOT="$OPTARG" ;;  # NEW
+    V) VENDOR_IMG="$OPTARG" ;;
     *) usage ;;
   esac
 done
@@ -55,6 +57,12 @@ fi
 if [ -n "$EFI_IMG" ] && [ ! -f "$EFI_IMG" ]; then
   echo "Error: EFI image '$EFI_IMG' does not exist." >&2
   ls -al "$EFI_IMG" || true
+  exit 1
+fi
+
+if [ -n "$VENDOR_IMG" ] && [ ! -f "$VENDOR_IMG" ]; then
+  echo "Error: vendor image '$VENDOR_IMG' does not exist." >&2
+  ls -al "$VENDOR_IMG" || true
   exit 1
 fi
 
@@ -91,12 +99,14 @@ echo "    STACK     : $STACK"
 echo "    DEBUG     : ${DEBUG:-auto}"
 echo "    ENV_LIST  : ${ENV_LIST:-}"
 echo "    EFI_IMG   : ${EFI_IMG:-<none>}"
+echo "    VENDOR_IMG: ${VENDOR_IMG:-<none>}"
 echo "    OVERLAYS  : ${OVERLAY_ROOT}"
 
 # --- Helpers ------------------------------------------------------------------
 cleanup_mounts() {
   set +e
   sudo umount "$MOUNT_POINT/boot/efi" 2>/dev/null || true
+  sudo umount "$MOUNT_POINT/vendor" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/dev/pts" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/run"      2>/dev/null || true
   sudo umount "$MOUNT_POINT/sys"      2>/dev/null || true
@@ -179,6 +189,11 @@ if [ -n "$EFI_IMG" ]; then
   sudo mkdir -p "$MOUNT_POINT/boot/efi"
   sudo mount -o loop "$EFI_IMG" "$MOUNT_POINT/boot/efi"
 
+  if [ -n "$VENDOR_IMG" ]; then
+    sudo mkdir -p "$MOUNT_POINT/vendor"
+    sudo mount -o loop "$VENDOR_IMG" "$MOUNT_POINT/vendor"
+  fi
+
   # GRUB device.map
   if [ -d "$MOUNT_POINT/boot/grub" ]; then
     printf "(hd0) %s\n(hd1) %sp1\n" "$LOOPDEV" "$LOOPDEV" | sudo tee "$MOUNT_POINT/boot/grub/device.map" >/dev/null || true
@@ -203,6 +218,7 @@ if [ -n "$EFI_IMG" ]; then
   [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
 
   echo "==> Unmounting root & EFI ..."
+  sudo umount "$MOUNT_POINT/vendor" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/boot/efi" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/dev/pts" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/run"      2>/dev/null || true
@@ -245,6 +261,11 @@ if [ "$IS_SPARSE" = true ]; then
   sudo mount -o loop "$RAW" "$MOUNT_POINT"
   mount_binds
 
+  if [ -n "$VENDOR_IMG" ]; then
+    sudo mkdir -p "$MOUNT_POINT/vendor"
+    sudo mount -o loop "$VENDOR_IMG" "$MOUNT_POINT/vendor"
+  fi
+
   # Optional, harmless for GRUB if present
   if [ -d "$MOUNT_POINT/boot/grub" ]; then
     printf "(hd0) %s\n(hd1) %s\n" "loopback" "loopback" | sudo tee "$MOUNT_POINT/boot/grub/device.map" >/dev/null || true
@@ -280,6 +301,11 @@ echo "==> Mounting ext4 filesystem via loop (no-efi) ..."
 sudo mkdir -p "$MOUNT_POINT"
 sudo mount -o loop "$FILESYSTEM" "$MOUNT_POINT"
 mount_binds
+
+if [ -n "$VENDOR_IMG" ]; then
+  sudo mkdir -p "$MOUNT_POINT/vendor"
+  sudo mount -o loop "$VENDOR_IMG" "$MOUNT_POINT/vendor"
+fi
 
 # If GRUB present, a minimal device.map can help; harmless if absent
 if [ -d "$MOUNT_POINT/boot/grub" ]; then

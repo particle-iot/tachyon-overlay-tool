@@ -15,16 +15,55 @@ RESOURCES = "$RESOURCES"
 overlay_search_paths = []
 
 def _collect_overlay_env_for_chroot():
-    """Return env KEY=VAL pairs to pass into chroot (PKG_* and PIN_PRIORITY)."""
+    """Return env KEY=VAL pairs to pass into chroot (PKG_*, ENV_*, and PIN_PRIORITY).
+
+    PKG_* : package version pins (consumed by the pin/check overlays as apt packages).
+    ENV_* : plain build/config values that are NOT apt packages (e.g. ENV_UBUNTU_24_04_VERSION).
+            They are forwarded so chroot scripts and 'when' gates can read them, but they must
+            never be treated as installable packages.
+    """
     env = {}
     for k, v in os.environ.items():
-        if k.startswith("PKG_") or k == "PIN_PRIORITY":
+        if k.startswith("PKG_") or k.startswith("ENV_") or k == "PIN_PRIORITY":
             env[k] = v
     return env
 
 def _env_prefix(env_dict):
     # Build 'KEY="VALUE" KEY2="VALUE2"' safely for shell
     return " ".join(f'{k}="{v}"' for k, v in env_dict.items())
+
+def _parse_version(v):
+    """Parse a dotted version string into a comparable tuple of ints (non-numeric parts -> 0)."""
+    return tuple(int(p) if p.isdigit() else 0 for p in str(v).split("."))
+
+def _step_enabled(step):
+    """Return False if a stack step should be skipped.
+
+    Honours the legacy 'enabled' bool and an optional 'when' gate that reads a
+    build env var (e.g. ENV_UBUNTU_24_04_VERSION, exported by the compose layer).
+    Supported 'when' operators (all optional; a step with no 'when' always runs):
+      - is  <value>   run iff env value equals <value>
+      - not <value>   run iff env value does not equal <value>
+      - min <version>  run iff env value is present and >= <version> (unset -> skip)
+    """
+    if "enabled" in step and not step["enabled"]:
+        return False
+    when = step.get("when")
+    if when:
+        env_name = when.get("env")
+        val = os.environ.get(env_name) if env_name else None
+        enabled = True
+        if "is" in when and val != when["is"]:
+            enabled = False
+        if "not" in when and val == when["not"]:
+            enabled = False
+        if "min" in when and (val is None or _parse_version(val) < _parse_version(when["min"])):
+            enabled = False
+        # Surface the gate decision so CI logs confirm the env value was read and acted on.
+        print(f"[when] step '{step.get('name')}': {env_name}={val!r} {when} -> "
+              f"{'RUN' if enabled else 'SKIP'}")
+        return enabled
+    return True
 
 def remove_json_comments(json_string):
     """Remove comments from JSON string."""
@@ -200,8 +239,9 @@ def apply_stack(mount_point, stack_path, resources):
 def process_stack_step(mount_point, step, resources):
     """Process a single step in a stack."""
     print(f"->> Processing stack step: {step['name']} with {step}")
-    if "enabled" in step and not step["enabled"]:
-        print(f"Skipping disabled stack step: {step['name']}")
+    if not _step_enabled(step):
+        gate = step.get("when", "enabled=false")
+        print(f"Skipping gated stack step: {step['name']} ({gate})")
         return
     if step["type"] == "overlay":
         found = False

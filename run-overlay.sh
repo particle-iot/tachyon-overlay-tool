@@ -44,13 +44,19 @@ done
 
 # ENV_LIST contains "KEY=VAL,KEY2=VAL2,..."
 if [ -n "${ENV_LIST:-}" ]; then
-  OLDIFS="$IFS"; IFS=',' 
-  for kv in $ENV_LIST; do 
+  OLDIFS="$IFS"; IFS=','
+  for kv in $ENV_LIST; do
     kv="$(echo "$kv" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"   # trim
     [ -n "$kv" ] && export "$kv"
   done
   IFS="$OLDIFS"
 fi
+
+# Surface ENV_* config values (plain build values, not packages) so CI logs confirm
+# they were received and forwarded into the overlay run.
+for ev in $(compgen -e | grep '^ENV_' || true); do
+  echo "[run-overlay] ENV value received: ${ev}=${!ev}"
+done
 
 [ -n "${FILESYSTEM:-}" ] && [ -n "${STACK:-}" ] && [ -n "${RESOURCES:-}" ] || usage
 [ -f "$FILESYSTEM" ] || { echo "Error: Filesystem '$FILESYSTEM' does not exist." >&2; exit 1; }

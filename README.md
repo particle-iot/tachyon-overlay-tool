@@ -246,6 +246,14 @@ Each step has:
  - type: "overlay" or "stack"
  - name: overlay or stack name to include
  - Optional: enabled (bool) — if present and false, the step is skipped.
+ - Optional: when (object) — gate the step on a build env var. The named var is
+   read from the tool's environment (the compose layer exports PKG_* vars). All
+   keys are optional; a step with no "when" always runs:
+     - env: the environment variable to read (e.g. "PKG_UBUNTU_24_04_VERSION")
+     - is  <value>:   run iff the env value equals <value>
+     - not <value>:   run iff the env value does not equal <value>
+     - min <version>: run iff the env value is present and >= <version>
+                      (dotted version compare; unset -> step is skipped)
 
 Example stack:
 
@@ -254,7 +262,10 @@ Example stack:
   "description": "Base system setup for Tachyon",
   "steps": [
     { "type": "overlay", "name": "set-hostname" },
-    { "type": "stack",   "name": "base" }
+    { "type": "stack",   "name": "base" },
+    // Only applied on Ubuntu 24.04 build 1.2 and later:
+    { "type": "overlay", "name": "add-tachyon-audio",
+      "when": { "env": "PKG_UBUNTU_24_04_VERSION", "min": "1.2" } }
   ]
 }
 

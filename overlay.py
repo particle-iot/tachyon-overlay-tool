@@ -295,7 +295,21 @@ def copy_files(source, destination, mount_point, resources, into_chroot=True, pe
         source_path = os.path.join(mount_point, source.lstrip("/"))
         dest_path = destination
         print(f"NOT into_chroot: Copying files from {source_path} to {dest_path}")
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    dest_dir = os.path.dirname(dest_path)
+    if into_chroot:
+        # The rootfs is root-owned, so the destination directory has to be created with
+        # the same privilege as the cp below. A plain os.makedirs fails outright under a
+        # root-owned parent (e.g. a new directory under /usr/share/doc), and where it does
+        # succeed it leaves the directory owned by the build user instead of root.
+        try:
+            subprocess.run(f"sudo mkdir -p {dest_dir}", shell=True, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error creating destination directory {dest_dir}: {e}")
+            sys.exit(1)
+    else:
+        # Copying out of the chroot writes to a host path (an overlay dir or $RESOURCES),
+        # which must stay writable by the unprivileged build user.
+        os.makedirs(dest_dir, exist_ok=True)
     try:
         subprocess.run(f"sudo cp -r {source_path} {dest_path}", shell=True, check=True)
     except subprocess.CalledProcessError as e:

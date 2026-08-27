@@ -135,6 +135,68 @@ mount_binds() {
   sudo mount --bind /dev/pts "$MOUNT_POINT/dev/pts"
 }
 
+# Is $1 a mount point? Reads /proc/self/mounts directly so this needs no util-linux tooling
+# (the build container is minimal). Paths with spaces would need \040 unescaping; the overlay
+# mount points never contain any.
+is_mounted() {
+  local p
+  p="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+  awk -v t="$p" '$2 == t { found = 1 } END { exit !found }' /proc/self/mounts
+}
+
+# Unmount everything under $1 and VERIFY it, returning non-zero if we cannot.
+#
+# Both overlay flows persist their changes by copying the filesystem back out -- the EFI flow
+# dd's the loop partition over the ext4 file, the sparse flow re-sparsifies it. Doing either
+# while the filesystem is still mounted yields an image that looks perfect and is quietly
+# wrong: ext4 commits its journal every few seconds, so e2fsck replays it and reports "clean",
+# but any write still sitting in the page cache is simply gone. The newest writes are the ones
+# lost. In a real 1.2.8 build that meant the last dpkg transaction's 9 files were never renamed
+# off their .dpkg-new names -- while dpkg's status file, already flushed, recorded the package
+# as installed -- and a just-created /etc/particle/distro_versions.json held another package's
+# control blob instead of its JSON. Nothing downstream catches it, because the filesystem is
+# internally consistent; it shipped, and the device then failed board detection.
+#
+# So a failed umount here MUST abort the build. The previous code ran every umount as
+# `2>/dev/null || true`, which is precisely what made that failure invisible.
+unmount_all_strictly() {
+  local mp sub i
+  mp="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+
+  # Inner mounts first; /dev/pts must go before /dev or it holds it busy.
+  for sub in vendor boot/efi dev/pts run sys proc dev; do
+    unmount_one "$mp/$sub" 6 || return 1
+  done
+  unmount_one "$mp" 10 || return 1
+  sync
+  return 0
+}
+
+# Unmount $1 until it is genuinely not a mount point, giving up after $2 attempts.
+#
+# Loops rather than unmounting once: mounts can be STACKED on one directory (a retried build
+# step, a bind that got applied twice), and each umount peels off only the top layer. A single
+# umount can therefore "succeed" while the path is still mounted -- which is the same hazard
+# this whole function exists to prevent.
+unmount_one() {
+  local target attempts limit
+  target="$1"; limit="$2"; attempts=0
+  while is_mounted "$target"; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -gt "$limit" ]; then
+      echo "ERROR: $target is still mounted after $limit umount attempts." >&2
+      command -v fuser >/dev/null 2>&1 && sudo fuser -vm "$target" >&2 2>&1 || true
+      return 1
+    fi
+    # A successful umount may have only removed one layer of a stack, so re-test rather
+    # than assuming we are done.
+    if sudo umount "$target"; then continue; fi
+    echo "WARN: umount $target is busy (attempt $attempts/$limit); retrying in 2s"
+    sleep 2
+  done
+  return 0
+}
+
 # --- Flow selector: ONLY by presence of EFI image -----------------------------
 ftype="$(file -b "$FILESYSTEM" || true)"
 IS_SPARSE=false
@@ -224,15 +286,11 @@ if [ -n "$EFI_IMG" ]; then
   [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
 
   echo "==> Unmounting root & EFI ..."
-  sudo umount "$MOUNT_POINT/vendor" 2>/dev/null || true
-  sudo umount "$MOUNT_POINT/boot/efi" 2>/dev/null || true
-  sudo umount "$MOUNT_POINT/dev/pts" 2>/dev/null || true
-  sudo umount "$MOUNT_POINT/run"      2>/dev/null || true
-  sudo umount "$MOUNT_POINT/sys"      2>/dev/null || true
-  sudo umount "$MOUNT_POINT/proc"     2>/dev/null || true
-  sudo umount "$MOUNT_POINT/dev"      2>/dev/null || true
-  sudo umount "$MOUNT_POINT"          2>/dev/null || true
-  sync
+  if ! unmount_all_strictly "$MOUNT_POINT"; then
+    echo "ERROR: refusing to dd a still-mounted filesystem back over $raw_ext4 -- the image" >&2
+    echo "       would pass e2fsck while silently missing its most recent writes." >&2
+    exit 1
+  fi
 
   echo "==> dd ${PART_ROOT} -> $raw_ext4 (persist changes) ..."
   sudo dd if="${PART_ROOT}" of="$raw_ext4" bs=8M iflag=fullblock oflag=direct status=progress
@@ -293,6 +351,10 @@ if [ "$IS_SPARSE" = true ]; then
 
   [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
   echo "==> Unmounting ..."
+  if ! unmount_all_strictly "$MOUNT_POINT"; then
+    echo "ERROR: refusing to re-sparsify a still-mounted filesystem -- see above." >&2
+    exit 1
+  fi
   cleanup_mounts
 
   echo "==> Re-sparsifying back into $FILESYSTEM ..."
@@ -341,9 +403,13 @@ else
     --stack="$STACK"
 fi
 
-# Cleanup
+# Cleanup. Unmounting the loop-mounted image IS how changes land here, so it must be verified.
 [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
 echo "==> Unmounting ..."
+if ! unmount_all_strictly "$MOUNT_POINT"; then
+  echo "ERROR: $FILESYSTEM may not have received all overlay writes -- see above." >&2
+  exit 1
+fi
 cleanup_mounts
 
 echo "Done."

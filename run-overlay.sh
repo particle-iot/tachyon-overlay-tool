@@ -144,56 +144,187 @@ is_mounted() {
   awk -v t="$p" '$2 == t { found = 1 } END { exit !found }' /proc/self/mounts
 }
 
-# Unmount everything under $1 and VERIFY it, returning non-zero if we cannot.
-#
-# Both overlay flows persist their changes by copying the filesystem back out -- the EFI flow
-# dd's the loop partition over the ext4 file, the sparse flow re-sparsifies it. Doing either
-# while the filesystem is still mounted yields an image that looks perfect and is quietly
-# wrong: ext4 commits its journal every few seconds, so e2fsck replays it and reports "clean",
-# but any write still sitting in the page cache is simply gone. The newest writes are the ones
-# lost. In a real 1.2.8 build that meant the last dpkg transaction's 9 files were never renamed
-# off their .dpkg-new names -- while dpkg's status file, already flushed, recorded the package
-# as installed -- and a just-created /etc/particle/distro_versions.json held another package's
-# control blob instead of its JSON. Nothing downstream catches it, because the filesystem is
-# internally consistent; it shipped, and the device then failed board detection.
-#
-# So a failed umount here MUST abort the build. The previous code ran every umount as
-# `2>/dev/null || true`, which is precisely what made that failure invisible.
-unmount_all_strictly() {
-  local mp sub i
-  mp="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+# Mount points at or under $1, deepest first. Enumerated from /proc/self/mounts rather than
+# from a fixed list, so submounts we never created ourselves are still found and removed in
+# an order that does not leave a parent busy.
+mounts_under() {
+  local p
+  p="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+  awk -v pre="$p" '{
+    mp = $2
+    if (mp == pre || index(mp, pre "/") == 1) { d = mp; n = gsub(/\//, "/", d); print n "\t" mp }
+  }' /proc/self/mounts | sort -k1,1nr | cut -f2-
+}
 
-  # Inner mounts first; /dev/pts must go before /dev or it holds it busy.
-  for sub in vendor boot/efi dev/pts run sys proc dev; do
-    unmount_one "$mp/$sub" 6 || return 1
+# PIDs whose root or cwd is inside $1 -- i.e. still running in the chroot.
+#
+# Done as ONE privileged scan: /proc/<pid>/root and /proc/<pid>/cwd are only readable as root,
+# and a `sudo readlink` per process per link would be hundreds of sudo invocations per call.
+chroot_pids() {
+  local mp
+  mp="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+  sudo sh -s "$mp" "$$" <<'SCAN'
+mp="$1"; me="$2"
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$me" ] && continue
+  for l in root cwd; do
+    t=$(readlink "$d/$l" 2>/dev/null) || continue
+    case "$t" in
+      "$mp"|"$mp"/*) echo "$pid"; break ;;
+    esac
   done
-  unmount_one "$mp" 10 || return 1
-  sync
+done
+SCAN
+}
+
+# Explain why $1 will not unmount, using only /proc. The build container has no psmisc, so
+# `fuser` is unavailable -- its absence previously left this failure with no diagnostic at all.
+why_busy() {
+  local target="$1"
+  echo "  mounts still under $target:" >&2
+  mounts_under "$target" | sed 's|^|      |' >&2
+  echo "  processes with root/cwd under $target:" >&2
+  sudo sh -s "$target" <<'SCAN' >&2
+mp="$1"
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  hit=
+  for l in root cwd; do
+    t=$(readlink "$d/$l" 2>/dev/null) || continue
+    case "$t" in "$mp"|"$mp"/*) hit=1 ;; esac
+  done
+  [ -n "$hit" ] || continue
+  echo "      pid $pid ($(cat "$d/comm" 2>/dev/null || echo '?'))"
+  for l in root cwd exe; do
+    t=$(readlink "$d/$l" 2>/dev/null) && echo "        $l -> $t"
+  done
+done
+SCAN
+  # Open file descriptors keep a mount busy without root/cwd pointing into it, so list those too.
+  echo "  open file descriptors under $target:" >&2
+  sudo sh -s "$target" <<'SCAN' >&2
+mp="$1"
+for d in /proc/[0-9]*/fd; do
+  pid=$(printf '%s' "$d" | sed 's|/proc/||; s|/fd$||')
+  for f in "$d"/*; do
+    t=$(readlink "$f" 2>/dev/null) || continue
+    case "$t" in
+      "$mp"|"$mp"/*) echo "      pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo '?')) fd -> $t" ;;
+    esac
+  done
+done
+SCAN
+  command -v fuser >/dev/null 2>&1 && sudo fuser -vm "$target" >&2 2>&1 || true
+}
+
+# Stop anything still running inside the chroot. Package maintainer scripts routinely leave
+# daemons behind (dbus, systemd helpers, gpg-agent), and such a process holds the chroot's
+# mounts busy. Leaving it running is what makes the unmount fail -- and, before that failure
+# was surfaced, is what let a live filesystem be copied out.
+kill_chroot_pids() {
+  local mp="$1" pid comm pids i
+  pids="$(chroot_pids "$mp")"
+  [ -n "$pids" ] || return 0
+  echo "==> Stopping processes still running inside $mp:"
+  for pid in $pids; do
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+    echo "    TERM pid $pid ($comm)"
+    sudo kill -TERM "$pid" 2>/dev/null || true
+  done
+  for i in 1 2 3 4 5; do
+    pids="$(chroot_pids "$mp")"
+    [ -n "$pids" ] || return 0
+    sleep 1
+  done
+  for pid in $(chroot_pids "$mp"); do
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+    echo "    KILL pid $pid ($comm) -- did not exit on TERM"
+    sudo kill -KILL "$pid" 2>/dev/null || true
+  done
+  sleep 1
   return 0
 }
 
 # Unmount $1 until it is genuinely not a mount point, giving up after $2 attempts.
+# $3 = "strict" (default) or "lazy-ok".
 #
-# Loops rather than unmounting once: mounts can be STACKED on one directory (a retried build
-# step, a bind that got applied twice), and each umount peels off only the top layer. A single
-# umount can therefore "succeed" while the path is still mounted -- which is the same hazard
-# this whole function exists to prevent.
+# Loops rather than unmounting once: mounts can be STACKED on one directory, and each umount
+# peels off only the top layer, so a single umount can "succeed" with the path still mounted --
+# the same hazard this whole mechanism exists to prevent.
+#
+# "lazy-ok" is permitted ONLY for host pseudo-filesystems bound into the chroot (/dev, /proc,
+# /sys, /run). Those carry none of the image's data, so detaching one lazily cannot lose a
+# write; it just gets the parent unstuck. It is never permitted for the image root or for a
+# mounted image (boot/efi, vendor), where a lazy unmount would skip the writeback that is the
+# entire point.
 unmount_one() {
-  local target attempts limit
-  target="$1"; limit="$2"; attempts=0
+  local target limit mode attempts
+  target="$1"; limit="$2"; mode="${3:-strict}"; attempts=0
   while is_mounted "$target"; do
     attempts=$((attempts + 1))
     if [ "$attempts" -gt "$limit" ]; then
+      if [ "$mode" = "lazy-ok" ] && sudo umount -l "$target" 2>/dev/null; then
+        echo "WARN: $target would not unmount; detached it lazily. It is a host pseudo-filesystem" >&2
+        echo "      carrying none of the image's data, so no write can be lost this way; the image" >&2
+        echo "      root below is still unmounted strictly." >&2
+        return 0
+      fi
       echo "ERROR: $target is still mounted after $limit umount attempts." >&2
-      command -v fuser >/dev/null 2>&1 && sudo fuser -vm "$target" >&2 2>&1 || true
+      why_busy "$target"
       return 1
     fi
-    # A successful umount may have only removed one layer of a stack, so re-test rather
-    # than assuming we are done.
     if sudo umount "$target"; then continue; fi
+    # Usually busy because something is mounted beneath it; -R takes the subtree.
+    if sudo umount -R "$target" 2>/dev/null; then continue; fi
     echo "WARN: umount $target is busy (attempt $attempts/$limit); retrying in 2s"
     sleep 2
   done
+  return 0
+}
+
+# Tear the chroot down and VERIFY it, returning non-zero if we cannot.
+#
+# Both overlay flows copy the filesystem back out after applying the stack -- the EFI flow dd's
+# the loop partition over the ext4 file, the sparse flow re-sparsifies it. Doing either while
+# the filesystem is still mounted yields an image that looks perfect and is quietly wrong: ext4
+# commits its journal every few seconds, so e2fsck replays it and reports "clean", but any write
+# still in the page cache is gone. The newest writes are the ones lost.
+#
+# Shipped 1.2.8 and 1.2.9 were both that image, in different places: 9 and 12 files from the
+# last dpkg transaction never renamed off their *.dpkg-new names (while dpkg's already-flushed
+# status file recorded the packages as installed), an unreplayed dpkg journal, and -- 1.2.8 --
+# /etc/particle/distro_versions.json holding another package's control blob, or -- 1.2.9 --
+# /etc/particle missing outright. Both passed e2fsck cleanly and shipped.
+unmount_all_strictly() {
+  local mp sub pass remaining
+  mp="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+
+  kill_chroot_pids "$mp"
+
+  # Submounts, deepest first, re-enumerated each pass so stacked and propagated mounts are
+  # all caught.
+  for pass in 1 2 3 4 5 6; do
+    remaining=0
+    while IFS= read -r sub; do
+      [ -n "$sub" ] || continue
+      [ "$sub" = "$mp" ] && continue
+      remaining=1
+      case "$sub" in
+        "$mp"/boot/efi|"$mp"/boot/efi/*|"$mp"/vendor|"$mp"/vendor/*)
+          unmount_one "$sub" 6 strict || return 1 ;;
+        *)
+          unmount_one "$sub" 3 lazy-ok || return 1 ;;
+      esac
+    done <<EOF
+$(mounts_under "$mp")
+EOF
+    [ "$remaining" -eq 0 ] && break
+  done
+
+  # The image root itself. Never lazy: a lazy unmount here would not flush the writeback.
+  unmount_one "$mp" 10 strict || return 1
+  sync
   return 0
 }
 

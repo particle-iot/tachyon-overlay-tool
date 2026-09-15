@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import sys
 import re
+import shlex
 import argparse
 import tempfile
 
@@ -322,14 +323,31 @@ def copy_files(source, destination, mount_point, resources, into_chroot=True, pe
             print(f"Error: Failed to set permissions to {permissions} for {dest_path}.")
             sys.exit(1)
 
+# Explicit mode: never infer a package manager from the host running the tool.
+package_manager = "apt"
+rpm_repo = None
+
 def install_package(mount_point, resources, package):
-    """Install a package inside the chroot environment."""
-    print(f"Installing package: {package}")
-    try:
-        subprocess.run(["sudo", "chroot", mount_point, "/bin/bash", "-c", f"apt-get install --no-install-recommends -y {package}"], check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error installing package {package}: {e}")
-        sys.exit(1)
+    """Install using APT or a single local RPM repository inside the chroot."""
+    packages = shlex.split(package)
+    if not packages or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:~=-]*", p) for p in packages):
+        raise ValueError("Expected package names/version pins, not command options or URLs")
+    if package_manager == "rpm-offline":
+        if not rpm_repo or not rpm_repo.startswith("/") or ".." in rpm_repo.split("/"):
+            raise ValueError("rpm-offline requires an absolute --rpm-repo inside the chroot")
+        metadata = os.path.join(mount_point, rpm_repo.lstrip("/"), "repodata", "repomd.xml")
+        if not os.path.isfile(metadata):
+            raise ValueError(f"Local RPM repository metadata missing: {metadata}")
+        command = ["dnf", "-y", "--disablerepo=*",
+                   "--setopt=reposdir=/dev/null",
+                   f"--repofrompath=particle-build,file://{rpm_repo}",
+                   "--enablerepo=particle-build", "--setopt=install_weak_deps=False",
+                   "--setopt=skip_if_unavailable=False", "--setopt=best=True",
+                   "--setopt=localpkg_gpgcheck=False", "--nogpgcheck", "install"]
+    else:
+        command = ["apt-get", "install", "--no-install-recommends", "-y"]
+    # No --skip-broken or fallback feed: an unresolved dependency fails the build.
+    subprocess.run(["sudo", "chroot", mount_point, *command, *packages], check=True)
 
 def delete_files(destination, mount_point, resources):
     """Delete files from the chroot environment."""
@@ -457,10 +475,16 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--overlay", help="Name of the overlay to apply")
     parser.add_argument("--stack", help="Name of the stack to apply")
+    parser.add_argument("--package-manager", choices=["apt", "rpm-offline"], default="apt")
+    parser.add_argument("--rpm-repo", help="Absolute path to the local repository INSIDE the chroot")
     parser.add_argument("--resources", help="Path to optional resources needed for overlays")
     parser.add_argument("--overlay-dirs", help="Colon-separated list of directories to search for overlays and stacks")
     parser.add_argument("command", choices=["list-overlays", "list-stacks", "apply"], help="Command to execute")
     args = parser.parse_args()
+    global package_manager, rpm_repo
+    package_manager, rpm_repo = args.package_manager, args.rpm_repo
+    if package_manager == "rpm-offline" and not rpm_repo:
+        parser.error("--rpm-repo is required for rpm-offline")
 
     #print out all args
     print("Arguments:")

@@ -469,3 +469,13 @@ Appendix: ASCII flow diagram
 │  - Calls overlay.py apply (stack)                    │
 │  - Cleans up mounts & loop devices                   │
 └──────────────────────────────────────────────────────┘
+### Offline QLI RPM composition
+
+Use `--package-manager rpm-offline --rpm-repo /tmp/particle-rpms` with
+`--mount-point` and a QLI stack. `--rpm-repo` is a path **inside the chroot**
+containing `repodata/repomd.xml`. The caller must verify each RPM's SHA-256 and
+identity against its source lock before staging this repository. The installer
+disables all external repositories, enables only that file repository, disables
+weak dependencies, and fails on unresolved dependencies. GPG checking is disabled
+for these checksum-locked build artifacts; this mode does not configure an
+update feed. APT remains the default for existing Ubuntu callers.
